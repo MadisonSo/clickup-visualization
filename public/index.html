@@ -4,6 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ClickUp Team Hours Visualization</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
@@ -15,9 +17,56 @@
       height: 40px;
       animation: spin 1s linear infinite;
     }
+    
     @keyframes spin {
       0% { transform: rotate(0deg); }
       100% { transform: rotate(360deg); }
+    }
+
+    .dropdown {
+      position: relative;
+      display: inline-block;
+    }
+
+    .dropdown-content {
+      display: none;
+      position: absolute;
+      right: 0;
+      background-color: white;
+      min-width: 180px;
+      box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+      border-radius: 8px;
+      z-index: 1000;
+      overflow: hidden;
+    }
+
+    .dropdown-content button {
+      width: 100%;
+      padding: 12px 16px;
+      text-align: left;
+      border: none;
+      background: white;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background-color 0.2s;
+    }
+
+    .dropdown-content button:hover {
+      background-color: #f3f4f6;
+    }
+
+    .dropdown.active .dropdown-content {
+      display: block;
+    }
+
+    /* Explicit button height to prevent ClickUp CSS interference */
+    .control-button {
+      height: 42px !important;
+      min-height: 42px !important;
+      max-height: 42px !important;
+      display: flex !important;
+      align-items: center !important;
+      box-sizing: border-box !important;
     }
   </style>
 </head>
@@ -27,16 +76,20 @@
   <script>
     const API_CONFIG = {
       proxyUrl: '',
-      apiToken: '',
       folderId: ''
     };
 
     let chartInstance = null;
     let currentViewMode = 'week';
+    let currentChartType = 'by-time'; // 'by-time' or 'by-project'
     let allTasksData = [];
-    let undatedTasksData = [];
+    let chartData = [];
+    let assigneeColors = {};
+    let projectColors = {};
+    let selectedYear = new Date().getFullYear();
+    let selectedAssignee = 'All Team'; // Track selected assignee filter
 
-    // Utility functions
+    // Color palette for assignees
     const generateColor = (index) => {
       const colors = [
         'rgba(136, 132, 216, 0.8)', 'rgba(130, 202, 157, 0.8)', 'rgba(255, 198, 88, 0.8)',
@@ -48,6 +101,7 @@
       return colors[index % colors.length];
     };
 
+    // Calculate working days between two dates (excluding weekends)
     const getWorkingDaysBetween = (startDate, endDate) => {
       let count = 0;
       let current = new Date(startDate);
@@ -61,40 +115,51 @@
       return count;
     };
 
+    // Get week identifier (Week 1-52 format)
     const getWeekKey = (date) => {
       const d = new Date(date);
       const year = d.getFullYear();
-      const oneJan = new Date(year, 0, 1);
-      const numberOfDays = Math.floor((d - oneJan) / (24 * 60 * 60 * 1000));
-      const weekNumber = Math.ceil((numberOfDays + oneJan.getDay() + 1) / 7);
-      return `${year}-W${String(weekNumber).padStart(2, '0')}`;
+      
+      // Only show weeks from selected year
+      if (year !== selectedYear) return null;
+      
+      // Calculate ISO week number
+      const target = new Date(d.valueOf());
+      const dayNr = (d.getDay() + 6) % 7;
+      target.setDate(target.getDate() - dayNr + 3);
+      const firstThursday = target.valueOf();
+      target.setMonth(0, 1);
+      if (target.getDay() !== 4) {
+        target.setMonth(0, 1 + ((4 - target.getDay()) + 7) % 7);
+      }
+      const weekNumber = 1 + Math.ceil((firstThursday - target) / 604800000);
+      
+      return `Week ${weekNumber}`;
     };
 
+    // Get month identifier (selected year only)
     const getMonthKey = (date) => {
       const d = new Date(date);
+      
+      // Only show months from selected year
+      if (d.getFullYear() !== selectedYear) return null;
+      
       const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      return `${monthNames[d.getMonth()]} ${d.getFullYear()}`;
+      return monthNames[d.getMonth()];
     };
 
+    // Get date range (selected year only: Jan 1 to Dec 31)
     const getDateRange = () => {
-      const now = new Date();
-      const start = new Date(now);
-      start.setMonth(start.getMonth() - 3);
-      const end = new Date(now);
-      end.setMonth(end.getMonth() + 3);
+      const start = new Date(selectedYear, 0, 1); // January 1
+      const end = new Date(selectedYear, 11, 31); // December 31
       return { start, end };
     };
 
-    // API functions
+    // Fetch data from proxy server
     const fetchFromProxy = async (path) => {
       const url = `${API_CONFIG.proxyUrl}?path=${encodeURIComponent(path)}`;
-      console.log('Fetching URL:', url);
-      
       const response = await fetch(url, {
-        headers: {
-          'Authorization': API_CONFIG.apiToken,
-          'Content-Type': 'application/json'
-        }
+        headers: { 'Content-Type': 'application/json' }
       });
 
       if (!response.ok) {
@@ -102,75 +167,220 @@
         throw new Error(errorData.error || 'Request failed');
       }
 
-      const data = await response.json();
-      console.log('Response data:', data);
-      return data;
+      return response.json();
     };
 
+    // Fetch all tasks from the folder
     const fetchFolderTasks = async () => {
       showLoading(true);
       clearError();
       
       try {
-        let allTasks = [];
-        
-        // Get folder details (which includes lists)
-        try {
-          console.log('Fetching folder:', API_CONFIG.folderId);
-          const folderData = await fetchFromProxy(`folder/${API_CONFIG.folderId}`);
-          console.log('Folder data received:', folderData);
-          console.log('Folder data keys:', Object.keys(folderData));
-          console.log('folderData.lists:', folderData.lists);
-          
-          const lists = folderData.lists || [];
-          console.log(`Found ${lists.length} lists in folder`);
-          console.log('Lists:', lists);
+        const folderData = await fetchFromProxy(`folder/${API_CONFIG.folderId}`);
+        const lists = folderData.lists || [];
 
-          for (const list of lists) {
-            try {
-              console.log(`Fetching tasks for list: ${list.name} (${list.id})`);
-              const tasksData = await fetchFromProxy(`list/${list.id}/task?include_closed=true`);
-              const tasks = tasksData.tasks || [];
-              console.log(`List "${list.name}" has ${tasks.length} tasks`);
-              allTasks = allTasks.concat(tasks);
-            } catch (err) {
-              console.error(`Failed to fetch tasks for list ${list.name}:`, err);
-            }
-          }
-        } catch (err) {
-          showError(`Failed to fetch folder data: ${err.message}`);
-          console.error('Error fetching folder:', err);
+        if (lists.length === 0) {
+          throw new Error('No lists found in folder. Check your Folder ID.');
         }
 
-        console.log(`Total tasks found: ${allTasks.length}`);
+        let allTasks = [];
+        
+        for (const list of lists) {
+          try {
+            const tasksData = await fetchFromProxy(`list/${list.id}/task?include_closed=true`);
+            allTasks = allTasks.concat(tasksData.tasks || []);
+          } catch (err) {
+            console.warn(`Failed to fetch tasks for list ${list.name}:`, err);
+          }
+        }
 
         if (allTasks.length === 0) {
-          showError('No tasks found in this folder. The lists might be empty or tasks might not have dates/time estimates.');
+          showError('No tasks found. Lists may be empty or tasks may lack dates/time estimates.');
         }
 
         allTasksData = allTasks;
         processTasksData(allTasks);
       } catch (err) {
         showError(err.message);
-        console.error('Error fetching tasks:', err);
       } finally {
         showLoading(false);
       }
     };
 
+    // Process tasks grouped by assignee with project breakdown
+    const processTasksByProject = (tasks) => {
+      const assigneeProjectData = {};
+      const assigneeSet = new Set();
+      const projectSet = new Set();
+      const undated = [];
+
+      // First pass: collect all projects/lists
+      tasks.forEach(task => {
+        const listName = task.list?.name || 'Unknown';
+        projectSet.add(listName);
+      });
+
+      // Second pass: process tasks with time estimates
+      tasks.forEach(task => {
+        const timeEstimate = task.time_estimate ? task.time_estimate / 3600000 : 0;
+        const startDate = task.start_date ? new Date(parseInt(task.start_date)) : null;
+        const dueDate = task.due_date ? new Date(parseInt(task.due_date)) : null;
+        const listName = task.list?.name || 'Unknown';
+
+        // Handle tasks without dates
+        if (!startDate || !dueDate) {
+          undated.push({
+            list: listName,
+            id: task.id,
+            name: task.name,
+            assignees: task.assignees?.map(a => a.username).join(', ') || 'Unassigned',
+            timeEstimate: timeEstimate.toFixed(2),
+            missingDates: !startDate && !dueDate ? 'Both' : !startDate ? 'Start Date' : 'Due Date'
+          });
+          return;
+        }
+
+        if (timeEstimate === 0) return;
+
+        const assignees = task.assignees?.length > 0 
+          ? task.assignees.map(a => a.username) 
+          : ['Unassigned'];
+
+        assignees.forEach(assignee => {
+          // Apply assignee filter
+          if (selectedAssignee !== 'All Team' && assignee !== selectedAssignee) return;
+          
+          assigneeSet.add(assignee);
+          
+          if (!assigneeProjectData[assignee]) {
+            assigneeProjectData[assignee] = {};
+          }
+          if (!assigneeProjectData[assignee][listName]) {
+            assigneeProjectData[assignee][listName] = 0;
+          }
+          assigneeProjectData[assignee][listName] += timeEstimate;
+        });
+      });
+
+      renderChartByProject(assigneeProjectData, Array.from(assigneeSet), Array.from(projectSet));
+      renderUndatedTasks(undated);
+    };
+
+    // Render chart grouped by assignee with project breakdown
+    const renderChartByProject = (assigneeProjectData, assignees, projects) => {
+      const sortedProjects = projects.sort();
+      
+      // Generate colors for assignees
+      assigneeColors = {};
+      assignees.forEach((assignee, index) => {
+        assigneeColors[assignee] = generateColor(index);
+      });
+
+      // Create datasets - one per assignee
+      const datasets = assignees.map((assignee, index) => {
+        const data = sortedProjects.map(project => {
+          return assigneeProjectData[assignee]?.[project] || 0;
+        });
+        
+        return {
+          label: assignee,
+          data: data,
+          backgroundColor: generateColor(index),
+          borderColor: generateColor(index).replace('0.8', '1'),
+          borderWidth: 1
+        };
+      });
+
+      // Store data for CSV export
+      chartData = sortedProjects.map(project => {
+        const row = { project };
+        assignees.forEach(assignee => {
+          row[assignee] = assigneeProjectData[assignee]?.[project] || 0;
+        });
+        return row;
+      });
+
+      const ctx = document.getElementById('mainChart');
+      if (chartInstance) chartInstance.destroy();
+
+      chartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: sortedProjects,
+          datasets: datasets
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: {
+              stacked: true,
+              title: {
+                display: true,
+                text: 'Project / List'
+              }
+            },
+            y: {
+              stacked: true,
+              title: {
+                display: true,
+                text: 'Total Hours'
+              }
+            }
+          },
+          plugins: {
+            legend: {
+              display: true,
+              position: 'bottom'
+            },
+            tooltip: {
+              callbacks: {
+                label: function(context) {
+                  return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} hrs`;
+                },
+                footer: function(tooltipItems) {
+                  const dataIndex = tooltipItems[0].dataIndex;
+                  let total = 0;
+                  
+                  tooltipItems[0].chart.data.datasets.forEach(dataset => {
+                    total += dataset.data[dataIndex] || 0;
+                  });
+                  
+                  return `Total: ${total.toFixed(2)} hrs`;
+                }
+              }
+            }
+          }
+        }
+      });
+      
+      // Populate filter dropdown with assignees
+      populateFilterDropdown(assignees);
+    };
+
+    // Process tasks and distribute hours across working days
     const processTasksData = (tasks) => {
+      if (currentChartType === 'by-project') {
+        processTasksByProject(tasks);
+        return;
+      }
+      
       const { start: rangeStart, end: rangeEnd } = getDateRange();
       const timeData = {};
       const undated = [];
       const assigneeSet = new Set();
+      const listSet = new Set();
 
       tasks.forEach(task => {
         const timeEstimate = task.time_estimate ? task.time_estimate / 3600000 : 0;
         const startDate = task.start_date ? new Date(parseInt(task.start_date)) : null;
         const dueDate = task.due_date ? new Date(parseInt(task.due_date)) : null;
+        const listName = task.list?.name || 'Unknown';
 
+        // Handle tasks without dates
         if (!startDate || !dueDate) {
           undated.push({
+            list: listName,
             id: task.id,
             name: task.name,
             assignees: task.assignees?.map(a => a.username).join(', ') || 'Unassigned',
@@ -185,6 +395,7 @@
         const workingDays = getWorkingDaysBetween(startDate, dueDate);
         if (workingDays === 0) return;
 
+        // Distribute hours evenly across working days
         const hoursPerDay = timeEstimate / workingDays;
         const assignees = task.assignees?.length > 0 
           ? task.assignees.map(a => a.username) 
@@ -197,50 +408,129 @@
             if (current >= rangeStart && current <= rangeEnd) {
               const key = currentViewMode === 'week' ? getWeekKey(current) : getMonthKey(current);
               
-              if (!timeData[key]) {
-                timeData[key] = {};
-              }
+              // Skip if key is null (outside current year)
+              if (key) {
+                if (!timeData[key]) timeData[key] = {};
 
-              assignees.forEach(assignee => {
-                assigneeSet.add(assignee);
-                if (!timeData[key][assignee]) {
-                  timeData[key][assignee] = 0;
-                }
-                timeData[key][assignee] += hoursPerDay;
-              });
+                assignees.forEach(assignee => {
+                  assigneeSet.add(assignee);
+                  listSet.add(listName);
+                  
+                  // Store data by assignee and list for filtering
+                  const dataKey = `${assignee}|||${listName}`; // Use delimiter to separate
+                  if (!timeData[key][dataKey]) timeData[key][dataKey] = 0;
+                  timeData[key][dataKey] += hoursPerDay;
+                });
+              }
             }
           }
           current.setDate(current.getDate() + 1);
         }
       });
 
-      undatedTasksData = undated;
-      renderChart(timeData, Array.from(assigneeSet));
+      renderChart(timeData, Array.from(assigneeSet), Array.from(listSet));
       renderUndatedTasks(undated);
     };
 
-    const renderChart = (timeData, assignees) => {
-      const periods = Object.keys(timeData).sort();
-      const datasets = assignees.map((assignee, index) => ({
-        label: assignee,
-        data: periods.map(period => timeData[period][assignee] || 0),
-        backgroundColor: generateColor(index),
-        borderColor: generateColor(index).replace('0.8', '1'),
-        borderWidth: 1
-      }));
+    // Render stacked bar chart
+    const renderChart = (timeData, assignees, lists) => {
+      // Generate all periods for the selected year
+      let allPeriods;
+      if (currentViewMode === 'week') {
+        allPeriods = Array.from({ length: 52 }, (_, i) => `Week ${i + 1}`);
+      } else {
+        allPeriods = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      }
+      
+      let datasets, maxCapacity;
+      
+      if (selectedAssignee === 'All Team') {
+        // TEAM VIEW: Show all assignees stacked
+        assigneeColors = {};
+        assignees.forEach((assignee, index) => {
+          assigneeColors[assignee] = generateColor(index);
+        });
 
-      const hoursPerPeriod = currentViewMode === 'week' ? 40 : 160;
-      const maxCapacity = assignees.length * hoursPerPeriod;
+        datasets = assignees.map((assignee, index) => {
+          const data = allPeriods.map(period => {
+            let total = 0;
+            // Sum across all lists for this assignee
+            lists.forEach(list => {
+              const key = `${assignee}|||${list}`;
+              total += (timeData[period] && timeData[period][key]) || 0;
+            });
+            return total;
+          });
+          
+          return {
+            label: assignee,
+            data: data,
+            backgroundColor: generateColor(index),
+            borderColor: generateColor(index).replace('0.8', '1'),
+            borderWidth: 1
+          };
+        });
+
+        const hoursPerPeriod = currentViewMode === 'week' ? 40 : 160;
+        maxCapacity = assignees.length * hoursPerPeriod;
+        
+        // Store data for CSV export
+        chartData = allPeriods.map(period => {
+          const row = { period };
+          assignees.forEach(assignee => {
+            let total = 0;
+            lists.forEach(list => {
+              const key = `${assignee}|||${list}`;
+              total += (timeData[period] && timeData[period][key]) || 0;
+            });
+            row[assignee] = total;
+          });
+          return row;
+        });
+        
+      } else {
+        // INDIVIDUAL VIEW: Show selected assignee's hours broken down by project/list
+        assigneeColors = {};
+        lists.forEach((list, index) => {
+          assigneeColors[list] = generateColor(index);
+        });
+
+        datasets = lists.map((list, index) => {
+          const data = allPeriods.map(period => {
+            const key = `${selectedAssignee}|||${list}`;
+            return (timeData[period] && timeData[period][key]) || 0;
+          });
+          
+          return {
+            label: list,
+            data: data,
+            backgroundColor: generateColor(index),
+            borderColor: generateColor(index).replace('0.8', '1'),
+            borderWidth: 1
+          };
+        });
+
+        const hoursPerPeriod = currentViewMode === 'week' ? 40 : 160;
+        maxCapacity = hoursPerPeriod; // Just one person's capacity
+        
+        // Store data for CSV export
+        chartData = allPeriods.map(period => {
+          const row = { period };
+          lists.forEach(list => {
+            const key = `${selectedAssignee}|||${list}`;
+            row[list] = (timeData[period] && timeData[period][key]) || 0;
+          });
+          return row;
+        });
+      }
 
       const ctx = document.getElementById('mainChart');
-      if (chartInstance) {
-        chartInstance.destroy();
-      }
+      if (chartInstance) chartInstance.destroy();
 
       chartInstance = new Chart(ctx, {
         type: 'bar',
         data: {
-          labels: periods,
+          labels: allPeriods,
           datasets: datasets
         },
         options: {
@@ -271,12 +561,24 @@
               callbacks: {
                 label: function(context) {
                   return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} hrs`;
+                },
+                footer: function(tooltipItems) {
+                  // Calculate total for the entire column (all assignees)
+                  const dataIndex = tooltipItems[0].dataIndex;
+                  let total = 0;
+                  
+                  // Sum all datasets for this column
+                  tooltipItems[0].chart.data.datasets.forEach(dataset => {
+                    total += dataset.data[dataIndex] || 0;
+                  });
+                  
+                  return `Total: ${total.toFixed(2)} hrs`;
                 }
               }
             },
             annotation: {
               annotations: {
-                line1: {
+                maxCapacityLine: {
                   type: 'line',
                   yMin: maxCapacity,
                   yMax: maxCapacity,
@@ -294,8 +596,12 @@
           }
         }
       });
+      
+      // Populate filter dropdown with assignees
+      populateFilterDropdown(assignees);
     };
 
+    // Render undated tasks table
     const renderUndatedTasks = (tasks) => {
       const container = document.getElementById('undatedTasks');
       if (tasks.length === 0) {
@@ -317,6 +623,7 @@
             <table class="w-full text-sm">
               <thead class="bg-gray-50">
                 <tr>
+                  <th class="px-4 py-2 text-left font-medium text-gray-700">List</th>
                   <th class="px-4 py-2 text-left font-medium text-gray-700">Task Name</th>
                   <th class="px-4 py-2 text-left font-medium text-gray-700">Assignees</th>
                   <th class="px-4 py-2 text-left font-medium text-gray-700">Time Estimate (hrs)</th>
@@ -326,6 +633,7 @@
               <tbody class="divide-y divide-gray-200">
                 ${tasks.map(task => `
                   <tr class="hover:bg-gray-50">
+                    <td class="px-4 py-2">${task.list}</td>
                     <td class="px-4 py-2">${task.name}</td>
                     <td class="px-4 py-2">${task.assignees}</td>
                     <td class="px-4 py-2">${task.timeEstimate}</td>
@@ -343,7 +651,121 @@
       `;
     };
 
-    // UI functions
+    // Export functions
+    const exportToPNG = async () => {
+      // Hide the entire export dropdown during capture
+      const exportDropdown = document.getElementById('exportDropdown');
+      const originalDisplay = exportDropdown.style.display;
+      exportDropdown.style.display = 'none';
+      
+      // Small delay to ensure DOM updates
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
+      const chartContainer = document.querySelector('.bg-white.rounded-lg.shadow-xl');
+      try {
+        const canvas = await html2canvas(chartContainer, {
+          backgroundColor: '#ffffff',
+          scale: 2,
+          logging: false
+        });
+        
+        const timestamp = new Date().toISOString().split('T')[0];
+        const link = document.createElement('a');
+        link.download = `team-hours-${timestamp}.png`;
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+      } catch (err) {
+        alert('Failed to export PNG: ' + err.message);
+      } finally {
+        // Restore export button
+        exportDropdown.style.display = originalDisplay;
+      }
+    };
+
+    const exportToPDF = async () => {
+      // Hide the entire export dropdown during capture
+      const exportDropdown = document.getElementById('exportDropdown');
+      const originalDisplay = exportDropdown.style.display;
+      exportDropdown.style.display = 'none';
+      
+      // Small delay to ensure DOM updates
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
+      const chartContainer = document.querySelector('.bg-white.rounded-lg.shadow-xl');
+      try {
+        const canvas = await html2canvas(chartContainer, {
+          backgroundColor: '#ffffff',
+          scale: 2,
+          logging: false
+        });
+        
+        const imgData = canvas.toDataURL('image/png');
+        const pdf = new jspdf.jsPDF({
+          orientation: 'landscape',
+          unit: 'px',
+          format: [canvas.width, canvas.height]
+        });
+        
+        pdf.addImage(imgData, 'PNG', 0, 0, canvas.width, canvas.height);
+        
+        const timestamp = new Date().toISOString().split('T')[0];
+        pdf.save(`team-hours-${timestamp}.pdf`);
+      } catch (err) {
+        alert('Failed to export PDF: ' + err.message);
+      } finally {
+        // Restore export button
+        exportDropdown.style.display = originalDisplay;
+      }
+    };
+
+    const exportToCSV = () => {
+      if (chartData.length === 0) {
+        alert('No data to export');
+        return;
+      }
+
+      const timestamp = new Date().toISOString().split('T')[0];
+      const assignees = Object.keys(assigneeColors);
+      const headers = ['Period', ...assignees, 'Total Hours'].join(',');
+      
+      const rows = chartData.map(row => {
+        const values = [row.period];
+        let total = 0;
+        assignees.forEach(assignee => {
+          const hours = row[assignee] || 0;
+          values.push(hours.toFixed(2));
+          total += hours;
+        });
+        values.push(total.toFixed(2));
+        return values.join(',');
+      });
+      
+      const csv = [headers, ...rows].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `team-hours-data-${timestamp}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    // Toggle dropdown
+    const toggleDropdown = (e) => {
+      e.stopPropagation();
+      const dropdown = document.getElementById('exportDropdown');
+      dropdown.classList.toggle('active');
+    };
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+      const dropdown = document.getElementById('exportDropdown');
+      if (dropdown && !dropdown.contains(e.target)) {
+        dropdown.classList.remove('active');
+      }
+    });
+
+    // UI: Show login screen
     const showLoginScreen = () => {
       document.getElementById('app').innerHTML = `
         <div class="min-h-screen flex items-center justify-center p-8">
@@ -356,18 +778,9 @@
                   type="text"
                   id="proxyUrl"
                   class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                  placeholder="https://your-app.vercel.app/api/clickup"
+                  placeholder="https://your-proxy.vercel.app/api/clickup"
                 />
-                <p class="text-xs text-gray-500 mt-1">Enter your deployed proxy server URL</p>
-              </div>
-              <div>
-                <label class="block text-sm font-medium text-gray-700 mb-2">ClickUp API Token</label>
-                <input
-                  type="password"
-                  id="apiToken"
-                  class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                  placeholder="Enter your API token"
-                />
+                <p class="text-xs text-gray-500 mt-1">Enter your proxy server URL (ends with /api/clickup)</p>
               </div>
               <div>
                 <label class="block text-sm font-medium text-gray-700 mb-2">Folder ID</label>
@@ -375,17 +788,15 @@
                   type="text"
                   id="folderId"
                   class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                  placeholder="Enter folder ID"
+                  placeholder="1234567890"
                 />
-                <p class="text-xs text-gray-500 mt-1">
-                  Find this in your ClickUp URL after /f/
-                </p>
+                <p class="text-xs text-gray-500 mt-1">Find in ClickUp URL after /f/</p>
               </div>
               <button
                 id="connectBtn"
                 class="w-full bg-purple-600 text-white py-2 px-4 rounded-lg hover:bg-purple-700 transition-colors font-medium"
               >
-                Connect to ClickUp
+                Load Visualization
               </button>
             </div>
           </div>
@@ -395,27 +806,70 @@
       document.getElementById('connectBtn').onclick = handleLogin;
     };
 
+    // UI: Show dashboard
     const showDashboard = () => {
       document.getElementById('app').innerHTML = `
         <div class="max-w-7xl mx-auto p-8">
           <div class="bg-white rounded-lg shadow-xl p-6 mb-6">
             <div class="flex justify-between items-center mb-6">
               <h1 class="text-3xl font-bold text-gray-800">Team Capacity Overview</h1>
-              <div class="flex gap-4">
-                <div class="flex bg-gray-100 rounded-lg p-1">
-                  <button id="weekBtn" class="px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium">
-                    Week
-                  </button>
-                  <button id="monthBtn" class="px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800">
-                    Month
-                  </button>
+              <div style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
+                <div style="display: flex; gap: 12px; align-items: center;">
+                  <div class="toggle-group">
+                    <button id="byTimeBtn" class="control-button px-4 py-2 rounded-l-lg transition-colors bg-white shadow text-purple-600 font-medium">
+                      By Time
+                    </button>
+                    <button id="byProjectBtn" class="control-button px-4 py-2 rounded-r-lg transition-colors text-gray-600 hover:text-gray-800">
+                      By Project
+                    </button>
+                  </div>
+                  <div class="toggle-group" id="timePeriodToggle">
+                    <button id="weekBtn" class="control-button px-4 py-2 rounded-l-lg transition-colors bg-white shadow text-purple-600 font-medium">
+                      Week
+                    </button>
+                    <button id="monthBtn" class="control-button px-4 py-2 rounded-r-lg transition-colors text-gray-600 hover:text-gray-800">
+                      Month
+                    </button>
+                  </div>
+                  <div class="dropdown" id="filterDropdown">
+                    <button id="filterBtn" class="control-button gap-2 bg-gray-100 text-gray-800 px-4 py-2 rounded-lg hover:bg-gray-200 transition-colors" style="min-width: 140px;">
+                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/>
+                      </svg>
+                      <span id="filterLabel">All Team</span>
+                      <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"/>
+                      </svg>
+                    </button>
+                    <div class="dropdown-content" id="filterList">
+                      <!-- Populated dynamically -->
+                    </div>
+                  </div>
                 </div>
-                <button id="refreshBtn" class="flex items-center gap-2 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition-colors">
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-width="2" d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16"/>
-                  </svg>
-                  Refresh
-                </button>
+                <div style="display: flex; flex-direction: column; gap: 8px; width: 140px;">
+                  <button id="refreshBtn" class="control-button gap-2 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition-colors" style="width: 100%;">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-width="2" d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16"/>
+                    </svg>
+                    Refresh
+                  </button>
+                  <div class="dropdown" id="exportDropdown" style="width: 100%;">
+                    <button class="control-button gap-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors" style="width: 100%;">
+                      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                      </svg>
+                      Export
+                      <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                        <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"/>
+                      </svg>
+                    </button>
+                    <div class="dropdown-content">
+                      <button id="exportPNG">📷 Download as PNG</button>
+                      <button id="exportPDF">📄 Download as PDF</button>
+                      <button id="exportCSV">📊 Export Data (CSV)</button>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
             <div id="errorContainer"></div>
@@ -432,20 +886,62 @@
 
       document.getElementById('weekBtn').onclick = () => switchViewMode('week');
       document.getElementById('monthBtn').onclick = () => switchViewMode('month');
+      document.getElementById('byTimeBtn').onclick = () => switchChartType('by-time');
+      document.getElementById('byProjectBtn').onclick = () => switchChartType('by-project');
       document.getElementById('refreshBtn').onclick = fetchFolderTasks;
+      document.getElementById('exportDropdown').onclick = toggleDropdown;
+      document.getElementById('exportPNG').onclick = exportToPNG;
+      document.getElementById('exportPDF').onclick = exportToPDF;
+      document.getElementById('exportCSV').onclick = exportToCSV;
+      document.getElementById('filterDropdown').onclick = toggleFilterDropdown;
+      
+      // Update UI based on initial chart type
+      updateChartTypeUI();
     };
 
-    const handleLogin = () => {
-      API_CONFIG.proxyUrl = document.getElementById('proxyUrl').value;
-      API_CONFIG.apiToken = document.getElementById('apiToken').value;
-      API_CONFIG.folderId = document.getElementById('folderId').value;
+    // Populate filter dropdown
+    const populateFilterDropdown = (assignees) => {
+      const dropdown = document.getElementById('filterList');
+      const sortedAssignees = ['All Team', ...assignees.sort()];
+      
+      dropdown.innerHTML = sortedAssignees.map(assignee => `
+        <button onclick="selectFilter('${assignee}')">${assignee}</button>
+      `).join('');
+    };
 
-      if (API_CONFIG.proxyUrl && API_CONFIG.apiToken && API_CONFIG.folderId) {
-        showDashboard();
-        fetchFolderTasks();
+    // Toggle filter dropdown
+    const toggleFilterDropdown = (e) => {
+      e.stopPropagation();
+      const dropdown = document.getElementById('filterDropdown');
+      dropdown.classList.toggle('active');
+    };
+
+    // Select filter
+    window.selectFilter = (assignee) => {
+      selectedAssignee = assignee;
+      document.getElementById('filterLabel').textContent = assignee;
+      document.getElementById('filterDropdown').classList.remove('active');
+      
+      if (allTasksData.length > 0) {
+        processTasksData(allTasksData);
       }
     };
 
+    // Handle login form submission
+    const handleLogin = () => {
+      API_CONFIG.proxyUrl = document.getElementById('proxyUrl').value.trim();
+      API_CONFIG.folderId = document.getElementById('folderId').value.trim();
+
+      if (!API_CONFIG.proxyUrl || !API_CONFIG.folderId) {
+        alert('Please enter both Proxy URL and Folder ID');
+        return;
+      }
+
+      showDashboard();
+      fetchFolderTasks();
+    };
+
+    // Switch between week and month view
     const switchViewMode = (mode) => {
       currentViewMode = mode;
       document.getElementById('weekBtn').className = mode === 'week' 
@@ -454,11 +950,44 @@
       document.getElementById('monthBtn').className = mode === 'month'
         ? 'px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium'
         : 'px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800';
+      
       if (allTasksData.length > 0) {
         processTasksData(allTasksData);
       }
     };
 
+    // Switch between by-time and by-project view
+    const switchChartType = (type) => {
+      currentChartType = type;
+      updateChartTypeUI();
+      
+      if (allTasksData.length > 0) {
+        processTasksData(allTasksData);
+      }
+    };
+
+    // Update UI elements based on current chart type
+    const updateChartTypeUI = () => {
+      const byTimeBtn = document.getElementById('byTimeBtn');
+      const byProjectBtn = document.getElementById('byProjectBtn');
+      const timePeriodToggle = document.getElementById('timePeriodToggle');
+      
+      if (currentChartType === 'by-time') {
+        byTimeBtn.className = 'px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium';
+        byProjectBtn.className = 'px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800';
+        
+        // Show week/month toggle
+        timePeriodToggle.style.display = 'flex';
+      } else {
+        byTimeBtn.className = 'px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800';
+        byProjectBtn.className = 'px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium';
+        
+        // Hide week/month toggle
+        timePeriodToggle.style.display = 'none';
+      }
+    };
+
+    // UI helpers
     const showLoading = (show) => {
       document.getElementById('loadingContainer').className = show 
         ? 'flex justify-center items-center h-96' 
@@ -478,7 +1007,7 @@
       document.getElementById('errorContainer').innerHTML = '';
     };
 
-    // Initialize
+    // Initialize app
     showLoginScreen();
   </script>
 </body>
