@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClickUp Team Hours Visualization</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .spinner {
+      border: 3px solid #f3f4f6;
+      border-top: 3px solid #9333ea;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body class="bg-gradient-to-br from-purple-50 to-blue-50 min-h-screen">
+  <div id="app"></div>
+
+  <script>
+    const API_CONFIG = {
+      proxyUrl: '',
+      apiToken: '',
+      folderId: ''
+    };
+
+    let chartInstance = null;
+    let currentViewMode = 'week';
+    let allTasksData = [];
+    let undatedTasksData = [];
+
+    // Utility functions
+    const generateColor = (index) => {
+      const colors = [
+        'rgba(136, 132, 216, 0.8)', 'rgba(130, 202, 157, 0.8)', 'rgba(255, 198, 88, 0.8)',
+        'rgba(255, 124, 124, 0.8)', 'rgba(164, 222, 108, 0.8)', 'rgba(208, 237, 87, 0.8)',
+        'rgba(131, 166, 237, 0.8)', 'rgba(141, 209, 225, 0.8)', 'rgba(208, 132, 208, 0.8)',
+        'rgba(244, 164, 96, 0.8)', 'rgba(32, 178, 170, 0.8)', 'rgba(255, 105, 180, 0.8)',
+        'rgba(186, 85, 211, 0.8)', 'rgba(205, 92, 92, 0.8)', 'rgba(70, 130, 180, 0.8)'
+      ];
+      return colors[index % colors.length];
+    };
+
+    const getWorkingDaysBetween = (startDate, endDate) => {
+      let count = 0;
+      let current = new Date(startDate);
+      const end = new Date(endDate);
+      
+      while (current <= end) {
+        const day = current.getDay();
+        if (day !== 0 && day !== 6) count++;
+        current.setDate(current.getDate() + 1);
+      }
+      return count;
+    };
+
+    const getWeekKey = (date) => {
+      const d = new Date(date);
+      const year = d.getFullYear();
+      const oneJan = new Date(year, 0, 1);
+      const numberOfDays = Math.floor((d - oneJan) / (24 * 60 * 60 * 1000));
+      const weekNumber = Math.ceil((numberOfDays + oneJan.getDay() + 1) / 7);
+      return `${year}-W${String(weekNumber).padStart(2, '0')}`;
+    };
+
+    const getMonthKey = (date) => {
+      const d = new Date(date);
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      return `${monthNames[d.getMonth()]} ${d.getFullYear()}`;
+    };
+
+    const getDateRange = () => {
+      const now = new Date();
+      const start = new Date(now);
+      start.setMonth(start.getMonth() - 3);
+      const end = new Date(now);
+      end.setMonth(end.getMonth() + 3);
+      return { start, end };
+    };
+
+    // API functions
+    const fetchFromProxy = async (path) => {
+      const url = `${API_CONFIG.proxyUrl}?path=${encodeURIComponent(path)}`;
+      console.log('Fetching URL:', url);
+      
+      const response = await fetch(url, {
+        headers: {
+          'Authorization': API_CONFIG.apiToken,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Request failed');
+      }
+
+      const data = await response.json();
+      console.log('Response data:', data);
+      return data;
+    };
+
+    const fetchFolderTasks = async () => {
+      showLoading(true);
+      clearError();
+      
+      try {
+        let allTasks = [];
+        
+        // Get folder details (which includes lists)
+        try {
+          console.log('Fetching folder:', API_CONFIG.folderId);
+          const folderData = await fetchFromProxy(`folder/${API_CONFIG.folderId}`);
+          console.log('Folder data received:', folderData);
+          console.log('Folder data keys:', Object.keys(folderData));
+          console.log('folderData.lists:', folderData.lists);
+          
+          const lists = folderData.lists || [];
+          console.log(`Found ${lists.length} lists in folder`);
+          console.log('Lists:', lists);
+
+          for (const list of lists) {
+            try {
+              console.log(`Fetching tasks for list: ${list.name} (${list.id})`);
+              const tasksData = await fetchFromProxy(`list/${list.id}/task?include_closed=true`);
+              const tasks = tasksData.tasks || [];
+              console.log(`List "${list.name}" has ${tasks.length} tasks`);
+              allTasks = allTasks.concat(tasks);
+            } catch (err) {
+              console.error(`Failed to fetch tasks for list ${list.name}:`, err);
+            }
+          }
+        } catch (err) {
+          showError(`Failed to fetch folder data: ${err.message}`);
+          console.error('Error fetching folder:', err);
+        }
+
+        console.log(`Total tasks found: ${allTasks.length}`);
+
+        if (allTasks.length === 0) {
+          showError('No tasks found in this folder. The lists might be empty or tasks might not have dates/time estimates.');
+        }
+
+        allTasksData = allTasks;
+        processTasksData(allTasks);
+      } catch (err) {
+        showError(err.message);
+        console.error('Error fetching tasks:', err);
+      } finally {
+        showLoading(false);
+      }
+    };
+
+    const processTasksData = (tasks) => {
+      const { start: rangeStart, end: rangeEnd } = getDateRange();
+      const timeData = {};
+      const undated = [];
+      const assigneeSet = new Set();
+
+      tasks.forEach(task => {
+        const timeEstimate = task.time_estimate ? task.time_estimate / 3600000 : 0;
+        const startDate = task.start_date ? new Date(parseInt(task.start_date)) : null;
+        const dueDate = task.due_date ? new Date(parseInt(task.due_date)) : null;
+
+        if (!startDate || !dueDate) {
+          undated.push({
+            id: task.id,
+            name: task.name,
+            assignees: task.assignees?.map(a => a.username).join(', ') || 'Unassigned',
+            timeEstimate: timeEstimate.toFixed(2),
+            missingDates: !startDate && !dueDate ? 'Both' : !startDate ? 'Start Date' : 'Due Date'
+          });
+          return;
+        }
+
+        if (timeEstimate === 0) return;
+
+        const workingDays = getWorkingDaysBetween(startDate, dueDate);
+        if (workingDays === 0) return;
+
+        const hoursPerDay = timeEstimate / workingDays;
+        const assignees = task.assignees?.length > 0 
+          ? task.assignees.map(a => a.username) 
+          : ['Unassigned'];
+
+        let current = new Date(startDate);
+        while (current <= dueDate) {
+          const day = current.getDay();
+          if (day !== 0 && day !== 6) {
+            if (current >= rangeStart && current <= rangeEnd) {
+              const key = currentViewMode === 'week' ? getWeekKey(current) : getMonthKey(current);
+              
+              if (!timeData[key]) {
+                timeData[key] = {};
+              }
+
+              assignees.forEach(assignee => {
+                assigneeSet.add(assignee);
+                if (!timeData[key][assignee]) {
+                  timeData[key][assignee] = 0;
+                }
+                timeData[key][assignee] += hoursPerDay;
+              });
+            }
+          }
+          current.setDate(current.getDate() + 1);
+        }
+      });
+
+      undatedTasksData = undated;
+      renderChart(timeData, Array.from(assigneeSet));
+      renderUndatedTasks(undated);
+    };
+
+    const renderChart = (timeData, assignees) => {
+      const periods = Object.keys(timeData).sort();
+      const datasets = assignees.map((assignee, index) => ({
+        label: assignee,
+        data: periods.map(period => timeData[period][assignee] || 0),
+        backgroundColor: generateColor(index),
+        borderColor: generateColor(index).replace('0.8', '1'),
+        borderWidth: 1
+      }));
+
+      const hoursPerPeriod = currentViewMode === 'week' ? 40 : 160;
+      const maxCapacity = assignees.length * hoursPerPeriod;
+
+      const ctx = document.getElementById('mainChart');
+      if (chartInstance) {
+        chartInstance.destroy();
+      }
+
+      chartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: periods,
+          datasets: datasets
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: {
+              stacked: true,
+              title: {
+                display: true,
+                text: currentViewMode === 'week' ? 'Week' : 'Month'
+              }
+            },
+            y: {
+              stacked: true,
+              title: {
+                display: true,
+                text: 'Total Hours'
+              }
+            }
+          },
+          plugins: {
+            legend: {
+              display: true,
+              position: 'bottom'
+            },
+            tooltip: {
+              callbacks: {
+                label: function(context) {
+                  return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} hrs`;
+                }
+              }
+            },
+            annotation: {
+              annotations: {
+                line1: {
+                  type: 'line',
+                  yMin: maxCapacity,
+                  yMax: maxCapacity,
+                  borderColor: 'rgb(255, 99, 132)',
+                  borderWidth: 2,
+                  borderDash: [5, 5],
+                  label: {
+                    content: 'Max Capacity',
+                    display: true,
+                    position: 'end'
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+    };
+
+    const renderUndatedTasks = (tasks) => {
+      const container = document.getElementById('undatedTasks');
+      if (tasks.length === 0) {
+        container.innerHTML = '';
+        return;
+      }
+
+      container.innerHTML = `
+        <div class="bg-white rounded-lg shadow-xl p-6 mt-6">
+          <div class="flex items-center gap-2 mb-4">
+            <svg class="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" stroke-width="2"/>
+              <line x1="12" y1="8" x2="12" y2="12" stroke-width="2"/>
+              <line x1="12" y1="16" x2="12.01" y2="16" stroke-width="2"/>
+            </svg>
+            <h2 class="text-xl font-bold text-gray-800">Tasks Missing Dates (${tasks.length})</h2>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-gray-50">
+                <tr>
+                  <th class="px-4 py-2 text-left font-medium text-gray-700">Task Name</th>
+                  <th class="px-4 py-2 text-left font-medium text-gray-700">Assignees</th>
+                  <th class="px-4 py-2 text-left font-medium text-gray-700">Time Estimate (hrs)</th>
+                  <th class="px-4 py-2 text-left font-medium text-gray-700">Missing</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-gray-200">
+                ${tasks.map(task => `
+                  <tr class="hover:bg-gray-50">
+                    <td class="px-4 py-2">${task.name}</td>
+                    <td class="px-4 py-2">${task.assignees}</td>
+                    <td class="px-4 py-2">${task.timeEstimate}</td>
+                    <td class="px-4 py-2">
+                      <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
+                        ${task.missingDates}
+                      </span>
+                    </td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    };
+
+    // UI functions
+    const showLoginScreen = () => {
+      document.getElementById('app').innerHTML = `
+        <div class="min-h-screen flex items-center justify-center p-8">
+          <div class="bg-white rounded-lg shadow-xl p-8 max-w-md w-full">
+            <h1 class="text-3xl font-bold text-gray-800 mb-6 text-center">ClickUp Team Hours</h1>
+            <div class="space-y-4">
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Proxy Server URL</label>
+                <input
+                  type="text"
+                  id="proxyUrl"
+                  class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                  placeholder="https://your-app.vercel.app/api/clickup"
+                />
+                <p class="text-xs text-gray-500 mt-1">Enter your deployed proxy server URL</p>
+              </div>
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">ClickUp API Token</label>
+                <input
+                  type="password"
+                  id="apiToken"
+                  class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                  placeholder="Enter your API token"
+                />
+              </div>
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Folder ID</label>
+                <input
+                  type="text"
+                  id="folderId"
+                  class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                  placeholder="Enter folder ID"
+                />
+                <p class="text-xs text-gray-500 mt-1">
+                  Find this in your ClickUp URL after /f/
+                </p>
+              </div>
+              <button
+                id="connectBtn"
+                class="w-full bg-purple-600 text-white py-2 px-4 rounded-lg hover:bg-purple-700 transition-colors font-medium"
+              >
+                Connect to ClickUp
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+
+      document.getElementById('connectBtn').onclick = handleLogin;
+    };
+
+    const showDashboard = () => {
+      document.getElementById('app').innerHTML = `
+        <div class="max-w-7xl mx-auto p-8">
+          <div class="bg-white rounded-lg shadow-xl p-6 mb-6">
+            <div class="flex justify-between items-center mb-6">
+              <h1 class="text-3xl font-bold text-gray-800">Team Capacity Overview</h1>
+              <div class="flex gap-4">
+                <div class="flex bg-gray-100 rounded-lg p-1">
+                  <button id="weekBtn" class="px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium">
+                    Week
+                  </button>
+                  <button id="monthBtn" class="px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800">
+                    Month
+                  </button>
+                </div>
+                <button id="refreshBtn" class="flex items-center gap-2 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 transition-colors">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-width="2" d="M21 2v6h-6M3 12a9 9 0 0 1 15-6.7L21 8M3 22v-6h6M21 12a9 9 0 0 1-15 6.7L3 16"/>
+                  </svg>
+                  Refresh
+                </button>
+              </div>
+            </div>
+            <div id="errorContainer"></div>
+            <div id="loadingContainer" class="hidden flex justify-center items-center h-96">
+              <div class="spinner"></div>
+            </div>
+            <div id="chartContainer" style="height: 500px;">
+              <canvas id="mainChart"></canvas>
+            </div>
+          </div>
+          <div id="undatedTasks"></div>
+        </div>
+      `;
+
+      document.getElementById('weekBtn').onclick = () => switchViewMode('week');
+      document.getElementById('monthBtn').onclick = () => switchViewMode('month');
+      document.getElementById('refreshBtn').onclick = fetchFolderTasks;
+    };
+
+    const handleLogin = () => {
+      API_CONFIG.proxyUrl = document.getElementById('proxyUrl').value;
+      API_CONFIG.apiToken = document.getElementById('apiToken').value;
+      API_CONFIG.folderId = document.getElementById('folderId').value;
+
+      if (API_CONFIG.proxyUrl && API_CONFIG.apiToken && API_CONFIG.folderId) {
+        showDashboard();
+        fetchFolderTasks();
+      }
+    };
+
+    const switchViewMode = (mode) => {
+      currentViewMode = mode;
+      document.getElementById('weekBtn').className = mode === 'week' 
+        ? 'px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium'
+        : 'px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800';
+      document.getElementById('monthBtn').className = mode === 'month'
+        ? 'px-4 py-2 rounded-md transition-colors bg-white shadow text-purple-600 font-medium'
+        : 'px-4 py-2 rounded-md transition-colors text-gray-600 hover:text-gray-800';
+      if (allTasksData.length > 0) {
+        processTasksData(allTasksData);
+      }
+    };
+
+    const showLoading = (show) => {
+      document.getElementById('loadingContainer').className = show 
+        ? 'flex justify-center items-center h-96' 
+        : 'hidden';
+      document.getElementById('chartContainer').style.display = show ? 'none' : 'block';
+    };
+
+    const showError = (message) => {
+      document.getElementById('errorContainer').innerHTML = `
+        <div class="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded mb-4">
+          ${message}
+        </div>
+      `;
+    };
+
+    const clearError = () => {
+      document.getElementById('errorContainer').innerHTML = '';
+    };
+
+    // Initialize
+    showLoginScreen();
+  </script>
+</body>
+</html>
